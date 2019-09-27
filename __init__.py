@@ -13,33 +13,60 @@
 # limitations under the License.
 
 import datetime
+import re
+from time import sleep
+
 import holidays
 import pytz
-import re
-import time
-import tzlocal
+from adapt.intent import IntentBuilder
 from astral import Astral
 
 import mycroft.audio
-from adapt.intent import IntentBuilder
-from mycroft.util.format import pronounce_number, nice_date, \
-                                nice_duration, nice_time
-from mycroft.util.lang.format_de import nice_time_de, pronounce_ordinal_de
-from mycroft.messagebus.message import Message
 from mycroft import MycroftSkill, intent_handler, intent_file_handler
-from mycroft.util.parse import extract_datetime, fuzzy_match, extract_number, normalize
-from mycroft.util.time import now_utc, default_timezone, to_local
+from mycroft.api import GeolocationApi
+from mycroft.messagebus.message import Message
 from mycroft.skills.core import resting_screen_handler
+from mycroft.util.format import nice_date, nice_duration, nice_time
+from mycroft.util.parse import (
+    extract_datetime,
+    fuzzy_match,
+    extract_number,
+    normalize
+)
+from mycroft.util.time import now_utc, to_local
+
+MARK_1_NUMBER_WIDTH = 4  # digits are 3 pixels wide + a space
+MARK_1_COLON_WIDTH = 2  # colon is 1 pixel wide + a space
+MARK_1_DISPLAY_WIDTH = 32
+
+mark_1_display_codes = {
+    ':': 'CIICAA',
+    '0': 'EIMHEEMHAA',
+    '1': 'EIIEMHAEAA',
+    '2': 'EIEHEFMFAA',
+    '3': 'EIEFEFMHAA',
+    '4': 'EIMBABMHAA',
+    '5': 'EIMFEFEHAA',
+    '6': 'EIMHEFEHAA',
+    '7': 'EIEAEAMHAA',
+    '8': 'EIMHEFMHAA',
+    '9': 'EIMBEBMHAA',
+    '9x8_blank': 'JIAAAAAAAAAAAAAAAAAA',
+    '7x8_blank': 'HIAAAAAAAAAAAAAAAAAA',
+    'alarm_dot': 'CIAACA',
+    'no_alarm_dot': 'CIAAAA'
+}
 
 
-class TimeSkill(MycroftSkill):
+class DateTimeSkill(MycroftSkill):
 
     def __init__(self):
-        super(TimeSkill, self).__init__("TimeSkill")
+        super(DateTimeSkill, self).__init__("DateTimeSkill")
         self.astral = Astral()
         self.displayed_time = None
         self.display_tz = None
         self.answering_query = False
+        self.geolocation_api = GeolocationApi()
 
     def initialize(self):
         # Start a callback that repeats every 10 seconds
@@ -79,9 +106,20 @@ class TimeSkill(MycroftSkill):
         self.gui.show_page('idle.qml')
 
     @property
-    def use_24hour(self):
+    def time_format_24_hour(self):
         return self.config_core.get('time_format') == 'full'
 
+    @property
+    def display_is_idle(self):
+        """Boolean indicating if the display is being used by another skill."""
+        return self.enclosure.display_manager.get_active() == ''
+
+    @property
+    def alarm_is_set(self):
+        msg = self.bus.wait_for_response(Message("private.mycroftai.has_alarm"))
+        return msg and msg.data.get("active_alarms", 0) > 0
+
+    # Deprecate
     def get_timezone(self, locale):
         try:
             # This handles common city names, like "Dallas" or "Paris"
@@ -139,6 +177,7 @@ class TimeSkill(MycroftSkill):
 
         return None
 
+    # Deprecate
     def get_local_datetime(self, location, dtUTC=None):
         if not dtUTC:
             dtUTC = now_utc()
@@ -156,6 +195,7 @@ class TimeSkill(MycroftSkill):
 
         return dtUTC.astimezone(tz)
 
+    # Deprecate
     def get_display_date(self, day=None, location=None):
         if not day:
             day = self.get_local_datetime(location)
@@ -164,6 +204,7 @@ class TimeSkill(MycroftSkill):
         else:
             return day.strftime("%Y/%-d/%-m")
 
+    # Deprecate
     def get_display_current_time(self, location=None, dtUTC=None):
         # Get a formatted digital clock time based on the user preferences
         dt = self.get_local_datetime(location, dtUTC)
@@ -171,81 +212,7 @@ class TimeSkill(MycroftSkill):
             return None
 
         return nice_time(dt, self.lang, speech=False,
-                         use_24hour=self.use_24hour)
-
-    def get_spoken_current_time(self, location=None, dtUTC=None, force_ampm=False):
-        # Get a formatted spoken time based on the user preferences
-        dt = self.get_local_datetime(location, dtUTC)
-        if not dt:
-            return
-
-        # speak AM/PM when talking about somewhere else
-        say_am_pm = bool(location) or force_ampm
-
-        s = nice_time(dt, self.lang, speech=True,
-                      use_24hour=self.use_24hour, use_ampm=say_am_pm)
-        # HACK: Mimic 2 has a bug with saying "AM".  Work around it for now.
-        if say_am_pm:
-            s = s.replace("AM", "A.M.")
-        return s
-
-    def display(self, display_time):
-        if display_time:
-            if self.platform == "mycroft_mark_1":
-                self.display_mark1(display_time)
-            self.display_gui(display_time)
-
-    def display_mark1(self, display_time):
-        # Map characters to the display encoding for a Mark 1
-        # (4x8 except colon, which is 2x8)
-        code_dict = {
-            ':': 'CIICAA',
-            '0': 'EIMHEEMHAA',
-            '1': 'EIIEMHAEAA',
-            '2': 'EIEHEFMFAA',
-            '3': 'EIEFEFMHAA',
-            '4': 'EIMBABMHAA',
-            '5': 'EIMFEFEHAA',
-            '6': 'EIMHEFEHAA',
-            '7': 'EIEAEAMHAA',
-            '8': 'EIMHEFMHAA',
-            '9': 'EIMBEBMHAA',
-        }
-
-        # clear screen (draw two blank sections, numbers cover rest)
-        if len(display_time) == 4:
-            # for 4-character times, 9x8 blank
-            self.enclosure.mouth_display(img_code="JIAAAAAAAAAAAAAAAAAA",
-                                         refresh=False)
-            self.enclosure.mouth_display(img_code="JIAAAAAAAAAAAAAAAAAA",
-                                         x=22, refresh=False)
-        else:
-            # for 5-character times, 7x8 blank
-            self.enclosure.mouth_display(img_code="HIAAAAAAAAAAAAAA",
-                                         refresh=False)
-            self.enclosure.mouth_display(img_code="HIAAAAAAAAAAAAAA",
-                                         x=24, refresh=False)
-
-        # draw the time, centered on display
-        xoffset = (32 - (4*(len(display_time))-2)) / 2
-        for c in display_time:
-            if c in code_dict:
-                self.enclosure.mouth_display(img_code=code_dict[c],
-                                             x=xoffset, refresh=False)
-                if c == ":":
-                    xoffset += 2  # colon is 1 pixels + a space
-                else:
-                    xoffset += 4  # digits are 3 pixels + a space
-
-        if self._is_alarm_set():
-            # Show a dot in the upper-left
-            self.enclosure.mouth_display(img_code="CIAACA", x=29, refresh=False)
-        else:
-            self.enclosure.mouth_display(img_code="CIAAAA", x=29, refresh=False)
-
-    def _is_alarm_set(self):
-        msg = self.bus.wait_for_response(Message("private.mycroftai.has_alarm"))
-        return msg and msg.data.get("active_alarms", 0) > 0
+                         use_24hour=self.time_format_24_hour)
 
     def display_gui(self, display_time):
         """ Display time on the Mycroft GUI. """
@@ -255,144 +222,93 @@ class TimeSkill(MycroftSkill):
         self.gui['date_string'] = self.get_display_date()
         self.gui.show_page('time.qml')
 
-    def _is_display_idle(self):
-        # check if the display is being used by another skill right now
-        # or _get_active() == "TimeSkill"
-        return self.enclosure.display_manager.get_active() == ''
-
     def update_display(self, force=False):
-        # Don't show idle time when answering a query to prevent
-        # overwriting the displayed value.
-        if self.answering_query:
-            return
+        """Display the time if the display is not in use.
 
-        self.gui['time_string'] = self.get_display_current_time()
+        The display is considered "in use" if another query in this skill is
+        actively using the display or the enclosure reports that the display
+        is in use for another reason.
+        """
+        while self.answering_query:
+            sleep(1)
+
+        current_datetime = datetime.datetime.now(self.display_tz)
+        display_time = self._get_display_time(current_datetime)
+        self.gui['time_string'] = display_time
         self.gui['date_string'] = self.get_display_date()
-        self.gui['ampm_string'] = '' # TODO
+        self.gui['ampm_string'] = ''  # TODO
 
-        if self.settings.get("show_time", False):
-            # user requested display of time while idle
-            if (force is True) or self._is_display_idle():
-                current_time = self.get_display_current_time()
-                if self.displayed_time != current_time:
-                    self.displayed_time = current_time
-                    self.display(current_time)
-                    # return mouth to 'idle'
+        if self.settings.get("show_time", False) or force:
+            if self.display_is_idle:
+                if self.displayed_time != display_time:
+                    self.displayed_time = display_time
+                    self._send_time_to_display(display_time)
                     self.enclosure.display_manager.remove_active()
             else:
                 self.displayed_time = None  # another skill is using display
         else:
-            # time display is not wanted
-            if self.displayed_time:
-                if self._is_display_idle():
-                    # erase the existing displayed time
+            if self.displayed_time is not None:
+                if self.display_is_idle:
                     self.enclosure.mouth_reset()
-                    # return mouth to 'idle'
                     self.enclosure.display_manager.remove_active()
                 self.displayed_time = None
 
-    def _extract_location(self, utt):
-        # if "Location" in message.data:
-        #     return message.data["Location"]
-        rx_file = self.find_resource('location.rx', 'regex')
-        if rx_file:
-            with open(rx_file) as f:
-                for pat in f.read().splitlines():
-                    pat = pat.strip()
-                    if pat and pat[0] == "#":
-                        continue
-                    res = re.search(pat, utt)
-                    if res:
-                        try:
-                            return res.group("Location")
-                        except IndexError:
-                            pass
-        return None
-
-    ######################################################################
-    ## Time queries / display
-
-    @intent_handler(IntentBuilder("").require("Query").require("Time").
-                    optionally("Location"))
+    @intent_handler(IntentBuilder('').require('Query').require('Time').
+                    optionally('Location'))
     def handle_query_time(self, message):
-        utt = message.data.get('utterance', "")
-        location = self._extract_location(utt)
-        current_time = self.get_spoken_current_time(location)
-        if not current_time:
-            return
+        """Handle a request for the current time."""
+        utterance = message.data.get('utterance')
+        location = self._extract_location(utterance) if utterance else None
+        tz = self._get_timezone(location)
+        if tz is not None:
+            current_datetime = datetime.datetime.now(tz)
+            use_am_pm = location is not None
+            worded_time = self._get_worded_time(current_datetime, use_am_pm)
+            self.speak_dialog("time.current", {"time": worded_time})
+            self._show_time(current_datetime)
+            mycroft.audio.wait_while_speaking()
+            self._reset_display()
 
-        # speak it
-        self.speak_dialog("time.current", {"time": current_time})
-
-        # and briefly show the time
-        self.answering_query = True
-        self.enclosure.deactivate_mouth_events()
-        self.display(self.get_display_current_time(location))
-        time.sleep(5)
-        mycroft.audio.wait_while_speaking()
-        self.enclosure.mouth_reset()
-        self.enclosure.activate_mouth_events()
-        self.answering_query = False
-        self.displayed_time = None
-
-    @intent_handler(IntentBuilder("current_time_handler_simple").
-                    require("Time").optionally("Location"))
+    @intent_handler(IntentBuilder('current_time_handler_simple').
+                    require('Time').optionally('Location'))
     def handle_current_time_simple(self, message):
         self.handle_query_time(message)
 
-    @intent_file_handler("what.time.will.it.be.intent")
+    @intent_file_handler('what.time.will.it.be.intent')
     def handle_query_future_time(self, message):
-        utt = normalize(message.data.get('utterance', "").lower())
-        extract = extract_datetime(utt)
-        if extract:
-            dt = extract[0]
-            utt = extract[1]
-        location = self._extract_location(utt)
-        future_time = self.get_spoken_current_time(location, dt, True)
-        if not future_time:
-            return
+        utterance = message.data.get('utterance')
+        utterance_datetime, utterance = self._parse_future_time_utterance(
+            utterance
+        )
+        if utterance is not None:
+            location = self._extract_location(utterance)
+            tz = self._get_timezone(location)
+            if tz is not None:
+                future_datetime = utterance_datetime.astimezone(tz)
+                worded_time = self._get_worded_time(
+                    future_datetime,
+                    use_am_pm=True
+                )
+                self.speak_dialog('time.future', {'time': worded_time})
+                self._show_time(future_datetime)
+                mycroft.audio.wait_while_speaking()
+                self._reset_display()
 
-        # speak it
-        self.speak_dialog("time.future", {"time": future_time})
-
-        # and briefly show the time
-        self.answering_query = True
-        self.enclosure.deactivate_mouth_events()
-        self.display(self.get_display_current_time(location, dt))
-        time.sleep(5)
-        mycroft.audio.wait_while_speaking()
-        self.enclosure.mouth_reset()
-        self.enclosure.activate_mouth_events()
-        self.answering_query = False
-        self.displayed_time = None
-
-    @intent_handler(IntentBuilder("future_time_handler_simple").
-                    require("Time").require("Future").optionally("Location"))
+    @intent_handler(IntentBuilder('future_time_handler_simple').
+                    require('Time').require('Future').optionally('Location'))
     def handle_future_time_simple(self, message):
         self.handle_query_future_time(message)
 
-    @intent_handler(IntentBuilder("").require("Display").require("Time").
-                    optionally("Location"))
+    @intent_handler(IntentBuilder('').require('Display').require('Time').
+                    optionally('Location'))
     def handle_show_time(self, message):
         self.display_tz = None
-        utt = message.data.get('utterance', "")
-        location = self._extract_location(utt)
-        if location:
-            tz = self.get_timezone(location)
-            if not tz:
-                self.speak_dialog("time.tz.not.found", {"location": location})
-                return
-            else:
-                self.display_tz = tz
-        else:
-            self.display_tz = None
-
-        # show time immediately
-        self.settings["show_time"] = True
-        self.update_display(True)
-
-    ######################################################################
-    ## Date queries
+        utterance = message.data.get('utterance')
+        location = self._extract_location(utterance) if utterance else None
+        tz = self._get_timezone(location)
+        if tz is not None:
+            self.display_tz = tz
+            self.update_display(force=True)
 
     def handle_query_date(self, message, response_type="simple"):
         utt = message.data.get('utterance', "").lower()
@@ -459,7 +375,7 @@ class TimeSkill(MycroftSkill):
         # and briefly show the date
         self.answering_query = True
         self.show_date(location, day=day)
-        time.sleep(10)
+        sleep(10)
         mycroft.audio.wait_while_speaking()
         if self.platform == "mycroft_mark_1":
             self.enclosure.mouth_reset()
@@ -523,6 +439,166 @@ class TimeSkill(MycroftSkill):
         next_leap_year = self.get_next_leap_year(year)
         self.speak_dialog('next.leap.year', {'year': next_leap_year})
 
+    def _extract_location(self, utterance):
+        """Extract the location from the utterance."""
+        location = None
+        for regex_pattern in self._get_location_patterns():
+            search_result = re.search(regex_pattern, utterance)
+            if search_result:
+                try:
+                    location = search_result.group("Location")
+                except IndexError:
+                    pass
+                else:
+                    self.log.debug('Found location in utterance: ' + location)
+                    break
+
+        return location
+
+    def _get_location_patterns(self):
+        """Get the regular expressions for finding location in an utterance.
+
+        The regular expression used can differ by language so search the
+        regex directory in this skill's root directory for a file that
+        matches the user's configured language.
+        """
+        location_patterns = []
+        regex_file_path = self.find_resource('location.rx', 'regex')
+        if regex_file_path:
+            with open(regex_file_path) as regex_file:
+                for record in regex_file.readlines():
+                    record_is_comment = record.startswith("#")
+                    if not record_is_comment:
+                        location_patterns.append(record.strip())
+
+        return location_patterns
+
+    def _get_timezone(self, location):
+        try:
+            if location is None:
+                tz_code = self.config_core['location']['timezone']['code']
+            else:
+                geolocation = self.geolocation_api.get_geolocation(location)
+                log_msg = 'Geolocation for "{}" is: {}'
+                self.log.info(log_msg.format(location, geolocation))
+                tz_code = geolocation['timezone']
+        except KeyError:
+            tz = None
+        else:
+            try:
+                tz = pytz.timezone(tz_code)
+            except pytz.exceptions.UnknownTimeZoneError:
+                tz = None
+
+        if tz is None:
+            self.speak_dialog("time.tz.not.found", {"location": location})
+
+        return tz
+
+    def _get_worded_time(self, response_datetime, use_am_pm):
+        """Convert datetime object to words based on the user preferences."""
+        time_dialog = nice_time(
+            response_datetime,
+            self.lang,
+            speech=True,
+            use_24hour=self.time_format_24_hour,
+            use_ampm=use_am_pm
+        )
+        # HACK: Mimic 2 has a bug with saying "AM".  Work around it for now.
+        if use_am_pm:
+            time_dialog = time_dialog.replace("AM", "A.M.")
+
+        return time_dialog
+
+    def _get_display_time(self, response_datetime):
+        # Get a formatted digital clock time based on the user preferences
+        return nice_time(
+            response_datetime,
+            self.lang,
+            speech=False,
+            use_24hour=self.time_format_24_hour
+        )
+
+    def _parse_future_time_utterance(self, utterance):
+        utterance_datetime = remaining_utterance = None
+        if utterance is not None:
+            utterance = normalize(utterance.lower())
+            parsed_utterance = extract_datetime(utterance)
+            if parsed_utterance:
+                utterance_datetime, remaining_utterance = parsed_utterance
+            else:
+                self.log.error(
+                    'Failed to extract a datetime from utterance: ' + utterance
+                )
+                self.speak_dialog("skill.error")
+
+        return utterance_datetime, remaining_utterance
+
+    def _show_time(self, response_datetime):
+        """Briefly show the time on the display, if there is one."""
+        self.answering_query = True
+        self.enclosure.deactivate_mouth_events()
+        display_time = self._get_display_time(response_datetime)
+        self._send_time_to_display(display_time)
+        sleep(5)
+
+    def _send_time_to_display(self, display_time):
+        if display_time:
+            if self.platform == "mycroft_mark_1":
+                self._display_time_on_mark_1(display_time)
+            self.display_gui(display_time)
+
+    def _display_time_on_mark_1(self, display_time):
+        self._clear_mark_1_display(display_time)
+        self._center_time_on_mark_1_display(display_time)
+        self._show_mark_1_alarm_indicator()
+
+    def _clear_mark_1_display(self, display_time):
+        """Draw two blank sections on Mark I display, numbers cover the rest"""
+        if len(display_time) == 4:
+            # for 4-character times (e.g. '1:00'), 9x8 blank on each side
+            image_code = mark_1_display_codes['9x8_blank']
+            x_offset = 22
+        else:
+            # for 5-character times (e.g. '12:00'), 7x8 blank on each side
+            image_code = mark_1_display_codes['7x8_blank']
+            x_offset = 24
+
+        self.enclosure.mouth_display(image_code, refresh=False)
+        self.enclosure.mouth_display(image_code, x=x_offset, refresh=False)
+
+    def _center_time_on_mark_1_display(self, display_time):
+        """Map characters to the display encoding for a Mark 1"""
+        time_display_width = MARK_1_NUMBER_WIDTH * len(display_time)
+        time_display_width -= MARK_1_COLON_WIDTH
+        x_offset = (MARK_1_DISPLAY_WIDTH - time_display_width) / 2
+        for character in display_time:
+            if character in mark_1_display_codes:
+                self.enclosure.mouth_display(
+                    img_code=mark_1_display_codes[character],
+                    x=x_offset,
+                    refresh=False
+                )
+                if character == ':':
+                    x_offset += MARK_1_COLON_WIDTH
+                else:
+                    x_offset += MARK_1_NUMBER_WIDTH
+
+    def _show_mark_1_alarm_indicator(self):
+        """Show a dot in the upper-left if an alarm is set."""
+        if self.alarm_is_set:
+            upper_left_code = mark_1_display_codes['alarm_dot']
+        else:
+            upper_left_code = mark_1_display_codes['no_alarm_dot']
+        self.enclosure.mouth_display(upper_left_code, x=29, refresh=False)
+
+    def _reset_display(self):
+        """Reset the display after showing the date or time."""
+        self.enclosure.mouth_reset()
+        self.enclosure.activate_mouth_events()
+        self.answering_query = False
+        self.displayed_time = None
+
     def show_date(self, location, day=None):
         if self.platform == "mycroft_mark_1":
             self.show_date_mark1(location, day)
@@ -568,4 +644,4 @@ class TimeSkill(MycroftSkill):
 
 
 def create_skill():
-    return TimeSkill()
+    return DateTimeSkill()
