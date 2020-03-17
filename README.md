@@ -10,6 +10,7 @@ Time can optionally be shown on a display, like a digital clock.  See
 the [Skill Setting](https://home.mycroft.ai/#/skill).
 
 This is a test
+This is another test.
 
 ## Examples 
 * "What time is it?"
